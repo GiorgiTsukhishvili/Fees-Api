@@ -82,3 +82,25 @@ type Bill struct {
 	CreatedAt time.Time
 	ClosedAt  *time.Time
 }
+
+type BillEventType string
+
+const (
+	EventBillCreated   BillEventType = "BILL_CREATED"
+	EventLineItemAdded BillEventType = "LINE_ITEM_ADDED"
+	EventBillClosing   BillEventType = "BILL_CLOSING"
+	EventBillClosed    BillEventType = "BILL_CLOSED"
+)
+
+// BillEvent is one entry in a bill's append-only audit log: every status
+// transition and every line item addition, in order, with the running
+// total as it stood right after the event. LineItemID is set only for
+// EventLineItemAdded.
+type BillEvent struct {
+	BillID         string
+	SequenceNumber int64
+	Type           BillEventType
+	LineItemID     string
+	RunningTotal   Money
+	OccurredAt     time.Time
+}
