@@ -23,6 +23,8 @@ func initService() (*Service, error) {
 
 	w, err := temporalclient.StartWorker(c, TaskQueue, func(w worker.Worker) {
 		w.RegisterWorkflow(BillWorkflow)
+		w.RegisterActivity(RecordLineItemActivity)
+		w.RegisterActivity(RecordBillClosedActivity)
 	})
 	if err != nil {
 		c.Close()

@@ -1,13 +1,22 @@
 package bills
 
 import (
-	"errors"
 	"fmt"
+	"time"
 
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
 const TaskQueue = "bills"
+
+// Update validator errors are classified via ApplicationError.Type so the
+// API layer (bills.go) can map them to the right HTTP status without
+// parsing error strings.
+const (
+	ErrTypeInvalidInput  = "INVALID_INPUT"
+	ErrTypeStateConflict = "STATE_CONFLICT"
+)
 
 type CreateBillInput struct {
 	BillID    string
@@ -42,6 +51,16 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 		CreatedAt: workflow.Now(ctx),
 	}
 
+	activityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 10 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Second,
+			BackoffCoefficient: 2.0,
+			MaximumInterval:    30 * time.Second,
+			MaximumAttempts:    5,
+		},
+	})
+
 	seen := make(map[string]AddLineItemResult)
 	var lineItemSeq int64
 
@@ -63,6 +82,18 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 			Amount:         in.Amount,
 			AddedAt:        workflow.Now(ctx),
 		}
+
+		err = workflow.ExecuteActivity(activityCtx, RecordLineItemActivity, RecordLineItemInput{
+			BillID:         state.ID,
+			LineItem:       item,
+			RunningTotal:   total,
+			SequenceNumber: lineItemSeq,
+		}).Get(ctx, nil)
+		if err != nil {
+			lineItemSeq--
+			return AddLineItemResult{}, err
+		}
+
 		state.LineItems = append(state.LineItems, item)
 		state.Total = total
 
@@ -73,15 +104,20 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 
 	validateAddLineItem := func(in AddLineItemInput) error {
 		if state.Status != StatusOpen {
-			return fmt.Errorf("cannot add line item: bill is %s", state.Status)
+			return temporal.NewApplicationError(fmt.Sprintf("cannot add line item: bill is %s", state.Status), ErrTypeStateConflict)
 		}
 		if in.IdempotencyKey == "" {
-			return errors.New("idempotency key is required")
+			return temporal.NewApplicationError("idempotency key is required", ErrTypeInvalidInput)
 		}
 		if in.Amount.Currency != state.Currency {
-			return fmt.Errorf("%w: bill is %s, line item is %s", ErrCurrencyMismatch, state.Currency, in.Amount.Currency)
+			return temporal.NewApplicationError(
+				fmt.Sprintf("%s: bill is %s, line item is %s", ErrCurrencyMismatch, state.Currency, in.Amount.Currency),
+				ErrTypeInvalidInput)
 		}
-		return in.Amount.Validate()
+		if err := in.Amount.Validate(); err != nil {
+			return temporal.NewApplicationError(err.Error(), ErrTypeInvalidInput)
+		}
+		return nil
 	}
 
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, "AddLineItem", addLineItem, workflow.UpdateHandlerOptions{
@@ -93,6 +129,18 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 	closeBill := func(ctx workflow.Context) (Bill, error) {
 		state.Status = StatusClosing
 		closedAt := workflow.Now(ctx)
+
+		err := workflow.ExecuteActivity(activityCtx, RecordBillClosedActivity, RecordBillClosedInput{
+			BillID:         state.ID,
+			Total:          state.Total,
+			ClosedAt:       closedAt,
+			SequenceNumber: lineItemSeq + 1,
+		}).Get(ctx, nil)
+		if err != nil {
+			state.Status = StatusOpen
+			return Bill{}, err
+		}
+
 		state.ClosedAt = &closedAt
 		state.Status = StatusClosed
 		return *state, nil
@@ -100,7 +148,7 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 
 	validateCloseBill := func() error {
 		if state.Status != StatusOpen {
-			return fmt.Errorf("cannot close bill: bill is %s", state.Status)
+			return temporal.NewApplicationError(fmt.Sprintf("cannot close bill: bill is %s", state.Status), ErrTypeStateConflict)
 		}
 		return nil
 	}

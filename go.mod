@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	encore.dev v1.57.13
+	go.temporal.io/api v1.63.4
 	go.temporal.io/sdk v1.48.0
 )
 
@@ -25,7 +26,6 @@ require (
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	go.temporal.io/api v1.63.4 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
