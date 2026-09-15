@@ -78,13 +78,31 @@ with no way to retry) — see `closeBill` in `bills/workflow.go`.
 - **`AddLineItem` is idempotent per caller-supplied key**, both in the workflow (an in-memory map, safe because of
   Temporal's replay determinism) and at the database layer (`UNIQUE (bill_id, idempotency_key)` on `line_items`,
   with `ON CONFLICT DO NOTHING`) — two independent layers, so a retried request never double-charges even if one
-  layer is bypassed.
+  layer is bypassed. Reusing a key with a *different* description/amount than the original request is rejected
+  outright rather than silently returning the stale cached result — a mismatched replay is a client bug, not a retry.
 - **Activities write absolute values, not increments** (`SET total_amount_minor = $running_total`, not `+= $amount`),
   computed once, deterministically, by the workflow. That makes retrying an activity a no-op rather than a
   double-application, regardless of *why* it's being retried (crash, at-least-once redelivery, timeout).
 - **`bill_events`** is an append-only audit ledger — every status transition and every line item addition, with the
   running total as it stood right after — giving a full audit trail beyond the current-state snapshot in `bills`.
   `line_items` itself is also immutable/append-only, so it doubles as line-item history.
+- **`CreateBill` compensates for a partial failure.** The workflow is started before the Postgres row is inserted;
+  if that insert fails, the workflow is terminated so the account+period isn't stuck forever. This is why
+  `WorkflowIDReusePolicy` is `ALLOW_DUPLICATE_FAILED_ONLY` rather than `REJECT_DUPLICATE`: a terminated (failed)
+  attempt must be retryable, while a bill that genuinely closed can never be recreated.
+
+## Concurrency
+
+`AddLineItem` and `CloseBill` both read-modify-write shared workflow state (`state.Total`, `state.LineItems`,
+a line-item sequence counter) across a `workflow.ExecuteActivity(...).Get()` call — and that call yields the
+coroutine. Temporal Update handlers run as separate coroutines that can be concurrently in-flight, so two updates
+admitted close together can each read the pre-update state before either writes back, and the second write clobbers
+the first — a classic lost update, entirely possible despite Temporal workflow code never running on more than one
+OS thread. Both handlers acquire a `workflow.Mutex` for their entire body (including the activity call) to
+serialize this, and re-check bill status and idempotency state *after* acquiring the lock — the pre-lock validator
+check alone isn't enough, since a concurrent `CloseBill` can complete while a handler is waiting its turn. Verified
+under real concurrent load: 20 parallel `AddLineItem` calls against one bill land as exactly 20 line items summing
+correctly, with no lost updates.
 
 ## Error mapping
 
