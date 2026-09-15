@@ -38,7 +38,7 @@ type AddLineItemResult struct {
 
 func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 	if !input.Currency.Valid() {
-		return Bill{}, fmt.Errorf("%w: %q", ErrInvalidCurrency, input.Currency)
+		return Bill{}, temporal.NewApplicationError(fmt.Sprintf("invalid currency: %q", input.Currency), ErrTypeInvalidInput)
 	}
 
 	state := &Bill{
