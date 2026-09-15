@@ -61,17 +61,43 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 		},
 	})
 
+	// AddLineItem and CloseBill both read-modify-write shared state across a
+	// workflow.ExecuteActivity(...).Get() yield point. Update handlers run
+	// as separate coroutines that can interleave at those yield points, so
+	// without this mutex two concurrent updates can each read the
+	// pre-update state, compute independently, and the second write clobbers
+	// the first (a lost update). Every mutating handler below acquires it
+	// for its entire body, including the activity call.
+	mutex := workflow.NewMutex(ctx)
+
 	seen := make(map[string]AddLineItemResult)
 	var lineItemSeq int64
 
 	addLineItem := func(ctx workflow.Context, in AddLineItemInput) (AddLineItemResult, error) {
+		if err := mutex.Lock(ctx); err != nil {
+			return AddLineItemResult{}, err
+		}
+		defer mutex.Unlock()
+
+		// Re-checked here, not just in the validator: a concurrent
+		// CloseBill may have completed while this handler was waiting on
+		// the lock, and a concurrent AddLineItem with the same key may
+		// have just recorded it.
 		if result, ok := seen[in.IdempotencyKey]; ok {
+			if result.LineItem.Description != in.Description || result.LineItem.Amount != in.Amount {
+				return AddLineItemResult{}, temporal.NewApplicationError(
+					"idempotency key already used with a different request", ErrTypeInvalidInput)
+			}
 			return result, nil
+		}
+		if state.Status != StatusOpen {
+			return AddLineItemResult{}, temporal.NewApplicationError(
+				fmt.Sprintf("cannot add line item: bill is %s", state.Status), ErrTypeStateConflict)
 		}
 
 		total, err := state.Total.Add(in.Amount)
 		if err != nil {
-			return AddLineItemResult{}, err
+			return AddLineItemResult{}, temporal.NewApplicationError(err.Error(), ErrTypeInvalidInput)
 		}
 
 		lineItemSeq++
@@ -127,6 +153,15 @@ func BillWorkflow(ctx workflow.Context, input CreateBillInput) (Bill, error) {
 	}
 
 	closeBill := func(ctx workflow.Context) (Bill, error) {
+		if err := mutex.Lock(ctx); err != nil {
+			return Bill{}, err
+		}
+		defer mutex.Unlock()
+
+		if state.Status != StatusOpen {
+			return Bill{}, temporal.NewApplicationError(fmt.Sprintf("cannot close bill: bill is %s", state.Status), ErrTypeStateConflict)
+		}
+
 		state.Status = StatusClosing
 		closedAt := workflow.Now(ctx)
 

@@ -33,10 +33,16 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 	billID := fmt.Sprintf("%s-%s", req.AccountID, req.PeriodID)
 
 	_, err := s.temporal.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:                                       billID,
-		TaskQueue:                                TaskQueue,
-		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-		WorkflowIDConflictPolicy:                 enums.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
+		ID:                       billID,
+		TaskQueue:                TaskQueue,
+		WorkflowIDConflictPolicy: enums.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
+		// FAILED_ONLY (not REJECT_DUPLICATE): a bill that completed
+		// successfully (closed) can never be recreated, but a bill whose
+		// workflow was compensated away below (terminated because its
+		// projection row failed to insert) must be retryable, or a
+		// transient Postgres error would permanently strand that
+		// account+period.
+		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
 	}, BillWorkflow, CreateBillInput{
 		BillID:    billID,
@@ -58,7 +64,12 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Bill
 		VALUES ($1, $2, $3, $4, $5, 0, $6)
 	`, billID, req.AccountID, req.PeriodID, req.Currency, StatusOpen, createdAt)
 	if err != nil {
-		return nil, errs.WrapCode(err, errs.Internal, "bill workflow started but projection failed to persist")
+		// Compensate: without this, the workflow would keep running with
+		// no matching Postgres row, and — since AddLineItem/CloseBill
+		// activities FK-reference bills.id — every future call against
+		// this bill ID would fail permanently.
+		_ = s.temporal.TerminateWorkflow(ctx, billID, "", "compensating: bill projection failed to persist")
+		return nil, errs.WrapCode(err, errs.Internal, "failed to persist bill; please retry")
 	}
 
 	return &Bill{
@@ -146,10 +157,19 @@ func classifyUpdateError(ctx context.Context, billID string, err error) error {
 	if errors.As(err, &notFound) || strings.Contains(err.Error(), "workflow execution already completed") {
 		var status BillStatus
 		lookupErr := db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, billID).Scan(&status)
-		if lookupErr == nil && status == StatusClosed {
+		switch {
+		case lookupErr == nil && status == StatusClosed:
 			return &errs.Error{Code: errs.Aborted, Message: "bill is closed"}
+		case errors.Is(lookupErr, sqldb.ErrNoRows):
+			return &errs.Error{Code: errs.NotFound, Message: "bill not found"}
+		case lookupErr != nil:
+			return errs.WrapCode(lookupErr, errs.Internal, "failed to look up bill while classifying update error")
+		default:
+			// Row exists but isn't CLOSED (e.g. CLOSING) — Temporal still
+			// rejected the update, so surface it as a conflict rather than
+			// a false 404.
+			return &errs.Error{Code: errs.Aborted, Message: "bill update rejected"}
 		}
-		return &errs.Error{Code: errs.NotFound, Message: "bill not found"}
 	}
 
 	return errs.WrapCode(err, errs.Internal, "workflow update failed")

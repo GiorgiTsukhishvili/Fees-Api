@@ -31,7 +31,7 @@ func (s *WorkflowTestSuite) Test_FullLifecycle() {
 	env := s.newEnv()
 
 	var addResult1, addResult2, addResultDup AddLineItemResult
-	var addErr, dupErr, crossCurrencyErr, addAfterCloseErr, closeErr error
+	var addErr, dupErr, crossCurrencyErr, reusedKeyErr, addAfterCloseErr, closeErr error
 	var closeResult Bill
 
 	env.RegisterDelayedCallback(func() {
@@ -70,7 +70,7 @@ func (s *WorkflowTestSuite) Test_FullLifecycle() {
 					addResultDup = r.(AddLineItemResult)
 				}
 			},
-		}, AddLineItemInput{IdempotencyKey: "k1", Description: "fee 1 retried", Amount: Money{AmountMinor: 500, Currency: USD}})
+		}, AddLineItemInput{IdempotencyKey: "k1", Description: "fee 1", Amount: Money{AmountMinor: 500, Currency: USD}})
 	}, 3*time.Second)
 
 	env.RegisterDelayedCallback(func() {
@@ -80,6 +80,20 @@ func (s *WorkflowTestSuite) Test_FullLifecycle() {
 			OnComplete: func(r any, err error) {},
 		}, AddLineItemInput{IdempotencyKey: "k4", Description: "wrong currency", Amount: Money{AmountMinor: 100, Currency: GEL}})
 	}, 4*time.Second)
+
+	env.RegisterDelayedCallback(func() {
+		// The mismatch is caught inside the handler (it needs to compare
+		// against the already-recorded line item), not the validator, so
+		// this update is legitimately Accepted — the rejection surfaces
+		// as an error from OnComplete, not OnReject.
+		env.UpdateWorkflow("AddLineItem", "u4b", &testsuite.TestUpdateCallback{
+			OnAccept: func() {},
+			OnReject: func(err error) { s.Fail("update should be accepted, then fail in the handler", err) },
+			OnComplete: func(r any, err error) {
+				reusedKeyErr = err
+			},
+		}, AddLineItemInput{IdempotencyKey: "k1", Description: "fee 1 but different amount", Amount: Money{AmountMinor: 999, Currency: USD}})
+	}, 4*time.Second+500*time.Millisecond)
 
 	env.RegisterDelayedCallback(func() {
 		env.UpdateWorkflow("CloseBill", "u5", &testsuite.TestUpdateCallback{
@@ -121,6 +135,7 @@ func (s *WorkflowTestSuite) Test_FullLifecycle() {
 	s.Equal(addResult1, addResultDup, "a retried idempotency key must return the original result, not double-add")
 
 	s.Error(crossCurrencyErr)
+	s.Error(reusedKeyErr, "a reused idempotency key with a different payload must be rejected")
 
 	s.NoError(closeErr)
 	s.Equal(StatusClosed, closeResult.Status)
